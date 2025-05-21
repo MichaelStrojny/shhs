@@ -325,6 +325,7 @@ class DiffusionScheduler(nn.Module):
         self,
         num_timesteps: int = 1000,
         num_levels: int = 3,
+        latent_dims_channels: List[int], # Added
         schedule_types: Union[str, List[str]] = 'cosine',
         beta_start: Union[float, List[float]] = 0.0001,
         beta_end: Union[float, List[float]] = 0.02,
@@ -336,6 +337,7 @@ class DiffusionScheduler(nn.Module):
         Args:
             num_timesteps: Number of diffusion timesteps
             num_levels: Number of hierarchical levels
+            latent_dims_channels: List of channel dimensions for each latent level.
             schedule_types: Type of noise schedule ('linear', 'cosine', 'quadratic')
                             Can be a single string for all levels or a list for level-specific schedules
             beta_start: Starting noise level(s)
@@ -347,6 +349,8 @@ class DiffusionScheduler(nn.Module):
         super().__init__()
         self.num_timesteps = num_timesteps
         self.num_levels = num_levels
+        self.latent_dims_channels = latent_dims_channels # Added
+        assert len(latent_dims_channels) == num_levels, "latent_dims_channels must have length num_levels"
         self.cross_level_conditioning = cross_level_conditioning
         
         # Handle level-specific or shared schedule types
@@ -387,9 +391,27 @@ class DiffusionScheduler(nn.Module):
             
             # Initialize with reasonable defaults: coarser levels influence finer ones
             for target_level in range(1, num_levels):
-                for source_level in range(target_level):
+                for source_level in range(target_level): # Only for source < target
                     # More influence from immediately coarser level, less from much coarser levels
                     self.cross_level_factors[target_level, source_level] = 0.2 / (target_level - source_level)
+
+            # Initialize channel projection layers
+            self.channel_projection_layers = nn.ModuleList()
+            for target_idx in range(self.num_levels):
+                for source_idx in range(self.num_levels):
+                    if source_idx == target_idx:
+                        self.channel_projection_layers.append(nn.Identity())
+                    else: # source_idx != target_idx
+                        if self.latent_dims_channels[source_idx] != self.latent_dims_channels[target_idx]:
+                            self.channel_projection_layers.append(
+                                nn.Conv2d(
+                                    self.latent_dims_channels[source_idx],
+                                    self.latent_dims_channels[target_idx],
+                                    kernel_size=1
+                                )
+                            )
+                        else: # channels are the same for source_idx != target_idx
+                            self.channel_projection_layers.append(nn.Identity())
         
         # Set up all schedules
         self._setup_schedules()
@@ -472,11 +494,12 @@ class DiffusionScheduler(nn.Module):
                     align_corners=False
                 )
             
-            # Channel dimension may also differ, we'll use a projection if needed
-            if source_latent.shape[1] != latents[target_level].shape[1]:
-                # Use 1x1 convolution to match channels (this is a simplified version)
-                # In practice, this would be a learned projection matrix
-                source_latent = source_latent.mean(dim=1, keepdim=True).expand(-1, latents[target_level].shape[1], -1, -1)
+            # Apply channel projection using the defined layer.
+            # This happens *after* spatial interpolation.
+            # The projection_idx corresponds to [target_level, source_level] in a conceptual 2D matrix flattened row-wise.
+            projection_idx = target_level * self.num_levels + source_level
+            projection_layer = self.channel_projection_layers[projection_idx]
+            source_latent = projection_layer(source_latent)
             
             # Add weighted influence
             influence += factor * source_latent
@@ -553,18 +576,20 @@ class DBNDenoiser(nn.Module):
         self,
         latent_sizes: List[int],
         hidden_units: Optional[List[int]] = None,
+        latent_dims_channels: List[int], # Added
         hidden_dim_factor: float = 2.0,
         num_timesteps: int = 1000,
         dbns_per_run: int = 10,
         cross_level_conditioning: bool = True,
-        schedule_types: Union[str, List[str]] = 'cosine',
+        schedule_types: Union[str, List[str]] = 'cosine', 
         device: Optional[torch.device] = None
     ):
         """
         Initialize the DBN denoiser.
         
         Args:
-            latent_sizes: List of binary latent sizes for each level
+            latent_sizes: List of binary latent sizes for each level (total elements, e.g. C*H*W).
+            latent_dims_channels: List of channel dimensions for each latent level.
             hidden_units: Optional list of hidden units for each level's DBNs
             hidden_dim_factor: Factor to determine hidden dimension size relative to visible dimension
             num_timesteps: Number of timesteps in the diffusion process
@@ -576,6 +601,8 @@ class DBNDenoiser(nn.Module):
         super().__init__()
         self.latent_sizes = latent_sizes
         self.num_levels = len(latent_sizes)
+        self.latent_dims_channels = latent_dims_channels # Added
+        assert len(latent_dims_channels) == self.num_levels, "latent_dims_channels must have the same length as latent_sizes"
         self.hidden_dim_factor = hidden_dim_factor
         self.num_timesteps = num_timesteps
         self.dbns_per_run = dbns_per_run
@@ -642,6 +669,7 @@ class DBNDenoiser(nn.Module):
         self.scheduler = DiffusionScheduler(
             num_timesteps=num_timesteps,
             num_levels=self.num_levels,
+            latent_dims_channels=self.latent_dims_channels, # Correctly passed here
             schedule_types=schedule_types,
             cross_level_conditioning=cross_level_conditioning
         )
@@ -709,10 +737,23 @@ class DBNDenoiser(nn.Module):
                         dbns_batch = [self.dbns[t - i][level_idx] for i in range(num_batch_timesteps)]
                         
                         # Create inputs for each DBN (all are the same current latent)
-                        inputs_batch = [latent for _ in range(num_batch_timesteps)]
+                        inputs_batch = [latent for _ in range(num_batch_timesteps)] # 'latent' here is latents[level_idx]
                         
+                        # Prepare source_latents_for_cl if dbns in batch are CrossLevelDBNs
+                        source_latents_for_cl = None
+                        if dbns_batch and hasattr(dbns_batch[0], 'target_visible_dim'):
+                            # If the DBN is a CrossLevelDBN, it implies level_idx > 0
+                            # (based on DBN construction logic in __init__).
+                            # Source latents are from coarser levels (0 to level_idx-1).
+                            # 'latents' is the input list to denoise_step.
+                            source_latents_for_cl = [latents[l] for l in range(level_idx)]
+
                         # Use quantum sampler for batch sampling
-                        batch_results = quantum_sampler.sample_dbns_batch(dbns_batch, inputs_batch)
+                        batch_results = quantum_sampler.sample_dbns_batch(
+                            dbns_batch, 
+                            inputs_batch, 
+                            source_latents_for_cl=source_latents_for_cl
+                        )
                         
                         # Use the first result (corresponding to current timestep)
                         denoised = batch_results[0]

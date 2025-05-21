@@ -123,9 +123,16 @@ class QADBNDM(nn.Module):
         # Calculate total binary latent size
         total_latent_size = self.encoder.get_total_latent_size()
         
+        # Determine latent sizes and channel dimensions for the DBNDenoiser
+        denoiser_latent_sizes = self.encoder.calculate_latent_sizes()
+        num_denoiser_levels = len(denoiser_latent_sizes)
+        # self.encoder.extended_latent_dims contains channel counts for all potential levels
+        latent_dims_channels_for_denoiser = self.encoder.extended_latent_dims[:num_denoiser_levels]
+
         # Create DBN denoiser for hierarchical latent space with enhanced conditioning
         self.denoiser = DBNDenoiser(
-            latent_sizes=self.encoder.calculate_latent_sizes(),
+            latent_sizes=denoiser_latent_sizes,
+            latent_dims_channels=latent_dims_channels_for_denoiser, # Added
             hidden_units=dbn_hidden_units,
             num_timesteps=num_timesteps,
             cross_level_conditioning=use_cross_level_conditioning,

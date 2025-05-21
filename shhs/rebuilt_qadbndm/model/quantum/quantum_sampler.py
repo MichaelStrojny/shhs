@@ -11,6 +11,7 @@ import torch.nn.functional as F
 import numpy as np
 import time
 from typing import List, Tuple, Dict, Optional, Union, Any
+import logging # Added
 
 try:
     import neal
@@ -19,6 +20,9 @@ try:
 except ImportError:
     QUANTUM_AVAILABLE = False
     print("Warning: D-Wave Neal not available. Using classical sampling only.")
+
+# Create a logger instance
+logger = logging.getLogger(__name__)
 
 class QuantumSampler:
     """
@@ -542,7 +546,8 @@ class QuantumSampler:
     def sample_dbns_batch(
         self, 
         dbns: List[nn.Module], 
-        inputs: List[torch.Tensor]
+        inputs: List[torch.Tensor],
+        source_latents_for_cl: Optional[List[torch.Tensor]] = None
     ) -> List[torch.Tensor]:
         """
         Sample from multiple DBNs in a single quantum annealing run.
@@ -550,6 +555,8 @@ class QuantumSampler:
         Args:
             dbns: List of DBN modules
             inputs: List of input tensors
+            source_latents_for_cl: Optional list of source latent states for CrossLevelDBNs.
+                                     Required if any DBN in the batch is a CrossLevelDBN.
             
         Returns:
             List of visible sample tensors
@@ -563,9 +570,12 @@ class QuantumSampler:
             for i in range(0, num_dbns, self.max_batch_size):
                 batch_dbns = dbns[i:i+self.max_batch_size]
                 batch_inputs = inputs[i:i+self.max_batch_size]
-                
-                # Process this batch
-                batch_results = self.sample_dbns_batch(batch_dbns, batch_inputs)
+                # Note: source_latents_for_cl is passed down. If it's relevant for only a subset,
+                # the user of this function should handle splitting/filtering it appropriately
+                # before calling this function, or this function could be made more complex
+                # to handle per-DBN source_latents. For now, we assume it's globally provided
+                # if any CL-DBN is present.
+                batch_results = self.sample_dbns_batch(batch_dbns, batch_inputs, source_latents_for_cl)
                 results.extend(batch_results)
             
             return results
@@ -573,16 +583,27 @@ class QuantumSampler:
         # Process DBNs in a batch
         samples_list = []
         
-        for i, (dbn, input_tensor) in enumerate(zip(dbns, inputs)):
+        for i, (dbn, input_tensor) in enumerate(zip(dbns, inputs)): # Ensure 'i' is available
             # Sample from this DBN
             if hasattr(dbn, 'target_visible_dim'):
-                # This is a CrossLevelDBN, we need source latents
-                # Since we don't have them here, fall back to standard sampling
-                _, samples, _ = dbn(input_tensor, k=1)
+                # This is a CrossLevelDBN
+                if source_latents_for_cl is None:
+                    # This case should ideally not be reached if called correctly,
+                    # as QuantumSampler raises ValueError if source_latents_for_cl is None for CLDBN.
+                    # However, if it were to be handled by falling back or if the check was elsewhere:
+                    # logger.warning(f"Attempting to sample CLDBN {type(dbn).__name__} at index {i} without source_latents_for_cl.")
+                    # For now, we assume the ValueError below will be hit if source_latents_for_cl is None.
+                    raise ValueError(
+                        "source_latents_for_cl must be provided when sampling a CrossLevelDBN."
+                    )
+                
+                logger.info(f"Using sample_cl_dbn for batched DBN (type: {type(dbn).__name__}) at index {i} in batch.")
+                _, samples, _ = self.sample_cl_dbn(dbn, input_tensor, source_latents_for_cl)
             else:
                 # Standard DBN
+                logger.info(f"Using sample_dbn for batched DBN (type: {type(dbn).__name__}) at index {i} in batch.")
                 _, samples, _ = self.sample_dbn(dbn, input_tensor)
             
             samples_list.append(samples)
         
-        return samples_list 
+        return samples_list
