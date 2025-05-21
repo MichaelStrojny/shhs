@@ -151,6 +151,68 @@ class QADBNDM(nn.Module):
         
         # Move to device
         self.to(device)
+
+    def compute_loss(self, original_data: torch.Tensor, 
+                     reconstruction: torch.Tensor, 
+                     encoded_latents: List[torch.Tensor], 
+                     denoised_latents: Optional[List[torch.Tensor]] = None) -> Dict[str, torch.Tensor]:
+        losses = {}
+        
+        # 1. Reconstruction Loss
+        losses['reconstruction'] = F.mse_loss(reconstruction, original_data)
+        
+        # 2. Binary Prior Loss (applied to encoded latents)
+        # Encourage binary latents to match the prior (e.g., 0.5 for max entropy, or other for biased bits)
+        # This can be seen as regularizing the output of the encoder.
+        binary_loss_terms = []
+        for lat in encoded_latents:
+            # Ensure latents are in [0,1] for BCE
+            # The encoder's output is sigmoid, so they are.
+            # Using binary_prior for each bit.
+            prior_expanded = self.binary_prior.expand_as(lat)
+            binary_loss_terms.append(F.binary_cross_entropy(lat, prior_expanded, reduction='mean'))
+        losses['binary'] = torch.stack(binary_loss_terms).mean() if binary_loss_terms else torch.tensor(0.0, device=original_data.device)
+
+        # 3. KL Divergence Loss (Placeholder - needs clear definition for this model)
+        # For now, let's make it zero. A true KL divergence term for a deterministic binary encoder
+        # is not standard. This might have been intended for something else,
+        # e.g. related to DBN energy or a different encoder type.
+        losses['kl'] = torch.tensor(0.0, device=original_data.device)
+        # TODO: Revisit KL divergence definition if specific model theory requires it.
+        # Could be:
+        # - Entropy of pre-binarized values from encoder.
+        # - A term to encourage DBN free energies to be low (though this is usually part of DBN training itself).
+
+        # 4. Denoising Loss
+        # This loss component checks if the denoised_latents are "better" than the encoded_latents,
+        # or closer to the original signal (encoded_latents before the denoiser's internal noising).
+        if denoised_latents is not None:
+            denoising_loss_terms = []
+            # The target for the denoised_latents should be the original encoded_latents
+            # as the denoiser's job was to remove noise that it internally added (or was passed).
+            for enc_lat, den_lat in zip(encoded_latents, denoised_latents):
+                # Ensure shapes match if adaptive hierarchy changes number of levels
+                if enc_lat.shape == den_lat.shape:
+                     denoising_loss_terms.append(F.mse_loss(den_lat, enc_lat))
+            if denoising_loss_terms:
+                losses['denoising'] = torch.stack(denoising_loss_terms).mean()
+            else: # If shapes didn't match for any level (e.g. adaptive hierarchy output mismatch)
+                losses['denoising'] = torch.tensor(0.0, device=original_data.device)
+        else:
+            losses['denoising'] = None # Or torch.tensor(0.0) if preferred when no denoising
+
+        # Total Weighted Loss
+        total_loss = (self.reconstruction_weight * losses['reconstruction'] +
+                      self.binary_weight * losses['binary'] +
+                      self.kl_weight * losses['kl'])
+        
+        if losses['denoising'] is not None:
+            # Add denoising loss if applicable. Assume a weight of 1 for it or make it configurable.
+            # For now, let's assume a weight of 1.0 for denoising loss if it's computed.
+            total_loss += losses['denoising'] 
+            
+        losses['total'] = total_loss
+        return losses
     
     def encode(self, x: torch.Tensor) -> List[torch.Tensor]:
         """
@@ -201,14 +263,14 @@ class QADBNDM(nn.Module):
             quantum_sampler=self.quantum_sampler if self.use_quantum else None
         )
     
-    def sample(
+    def generate(
         self, 
         batch_size: int = 1, 
         noise_level: float = 1.0, 
         steps: Optional[int] = None
     ) -> torch.Tensor:
         """
-        Sample from the model by starting from noise and denoising.
+        Generate samples from the model by starting from noise and denoising.
         
         Args:
             batch_size: Number of samples to generate
@@ -315,40 +377,35 @@ class QADBNDM(nn.Module):
             use_cross_level=self.use_cross_level_conditioning
         )
     
-    def forward(
-        self, 
-        x: torch.Tensor, 
-        noise_level: Optional[float] = None,
-        return_latents: bool = False
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]]]:
+    def forward(self, x: torch.Tensor, denoise_noise_level: Optional[float] = None, return_latents: bool = True) -> Dict[str, torch.Tensor]:
         """
         Forward pass through the model.
         
         Args:
             x: Input tensor
-            noise_level: Optional noise level (0 to 1) to add during autoencoding
-            return_latents: Whether to return latent representations
+            denoise_noise_level: Optional noise level (0 to 1) to add during autoencoding via the denoiser.
+            return_latents: Whether to return latent representations. Default True.
             
         Returns:
-            Reconstructed tensor or tuple of (reconstructed tensor, latents)
+            Dictionary containing reconstruction, encoded_latents, and optionally denoised_latents.
         """
-        # Encode to hierarchical binary latent space
-        latents = self.encode(x)
+        encoded_latents = self.encode(x)
+        reconstruction_input_latents = encoded_latents
+        denoised_latents_output = None
+
+        if denoise_noise_level is not None and denoise_noise_level > 0:
+            # Pass original latents to be noised and then denoised by the denoiser
+            denoised_latents_output = self.denoise(encoded_latents, noise_level=denoise_noise_level)
+            # For reconstruction, typically use the output of the denoiser if denoising was active
+            reconstruction_input_latents = denoised_latents_output
         
-        # Get active level indices based on returned latents
-        active_level_indices = list(range(len(latents)))
+        reconstruction = self.decode(reconstruction_input_latents, level_indices=list(range(len(reconstruction_input_latents))))
         
-        # Apply denoising if noise level is specified
-        if noise_level is not None and noise_level > 0:
-            latents = self.denoise(latents, noise_level)
-        
-        # Decode back to input space
-        reconstruction = self.decode(latents, active_level_indices)
-        
-        if return_latents:
-            return reconstruction, latents
-        else:
-            return reconstruction
+        return_dict = {'recon': reconstruction, 'encoded_latents': encoded_latents}
+        if denoised_latents_output is not None:
+            return_dict['denoised_latents'] = denoised_latents_output
+            
+        return return_dict
 
     def update_temperature(self, epoch: int, max_epochs: int):
         """

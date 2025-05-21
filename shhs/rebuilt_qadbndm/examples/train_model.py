@@ -44,6 +44,8 @@ def parse_args():
     parser.add_argument("--kl_weight", type=float, default=0.1, help="KL divergence loss weight")
     parser.add_argument("--save_interval", type=int, default=10, help="Epoch interval for saving model")
     parser.add_argument("--device", type=str, default=None, help="Device to use (default: auto)")
+    parser.add_argument("--max_batches_per_epoch", type=int, default=None,
+                          help="Maximum number of batches to process per epoch (for quick testing)")
     
     return parser.parse_args()
 
@@ -155,15 +157,15 @@ def save_reconstructions(model, data_loader, device, save_path, num_samples=10):
     
     # Reconstruction with and without denoising
     with torch.no_grad():
-        outputs_with_denoise = model(samples, denoise=True)
-        outputs_without_denoise = model(samples, denoise=False)
+        outputs_with_denoise = model(samples, denoise_noise_level=0.5)
+        outputs_without_denoise = model(samples, denoise_noise_level=None)
         
         recon_with_denoise = outputs_with_denoise['recon']
         recon_without_denoise = outputs_without_denoise['recon']
     
     # Generate random samples
     with torch.no_grad():
-        random_samples = model.generate(num_samples)
+        random_samples = model.generate(batch_size=num_samples)
     
     # Create figure
     fig, axs = plt.subplots(4, num_samples, figsize=(num_samples * 2, 8))
@@ -232,8 +234,8 @@ def visualize_latents(model, data_loader, device, save_path):
     
     # Get binary latents
     with torch.no_grad():
-        outputs = model(samples, denoise=False)
-        binary_latents = outputs['latents']
+        outputs = model(samples, denoise_noise_level=None)
+        binary_latents = outputs['encoded_latents']
     
     # For visualization, we'll use the first level latent (coarsest)
     latent = binary_latents[-1]  # Last in the list is coarsest
@@ -258,26 +260,33 @@ def visualize_latents(model, data_loader, device, save_path):
     plt.savefig(save_path)
     plt.close()
 
-def train_epoch(model, train_loader, optimizer, device, epoch, max_epochs):
+def train_epoch(model, train_loader, optimizer, device, epoch, max_epochs, args):
     """Train for one epoch"""
     model.train()
     running_loss = 0.0
     running_recon_loss = 0.0
     running_binary_loss = 0.0
     running_denoise_loss = 0.0
+    processed_batches = 0
     
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{max_epochs}")
-    for data, _ in pbar:
+    if args.max_batches_per_epoch is not None:
+        print(f"  >>> Limiting to {args.max_batches_per_epoch} batches for this epoch.")
+
+    for batch_idx, (data, _) in enumerate(pbar):
+        if args.max_batches_per_epoch is not None and batch_idx >= args.max_batches_per_epoch:
+            print(f"  >>> Reached max_batches_per_epoch ({args.max_batches_per_epoch}), stopping epoch early.")
+            break
         data = data.to(device)
         
         # Zero gradients
         optimizer.zero_grad()
         
         # Forward pass
-        outputs = model(data, denoise=True)
+        outputs = model(data, denoise_noise_level=0.5) # Using 0.5 as default noise level
         reconstruction = outputs['recon']
-        binary_latents = outputs['latents']
-        denoised_latents = outputs['denoised_latents']
+        binary_latents = outputs['encoded_latents']
+        denoised_latents = outputs.get('denoised_latents')
         
         # Compute loss
         loss_dict = model.compute_loss(data, reconstruction, binary_latents, denoised_latents)
@@ -293,22 +302,22 @@ def train_epoch(model, train_loader, optimizer, device, epoch, max_epochs):
         running_binary_loss += loss_dict['binary'].item()
         if loss_dict['denoising'] is not None:
             running_denoise_loss += loss_dict['denoising'].item()
+        processed_batches += 1
         
         # Update progress bar
         pbar.set_postfix({
-            'loss': running_loss / (pbar.n + 1),
-            'recon': running_recon_loss / (pbar.n + 1),
+            'loss': running_loss / processed_batches,
+            'recon': running_recon_loss / processed_batches,
         })
     
     # Update temperature schedule
     model.update_temperature(epoch, max_epochs)
     
     # Calculate epoch losses
-    num_batches = len(train_loader)
-    epoch_loss = running_loss / num_batches
-    epoch_recon_loss = running_recon_loss / num_batches
-    epoch_binary_loss = running_binary_loss / num_batches
-    epoch_denoise_loss = running_denoise_loss / num_batches
+    epoch_loss = running_loss / processed_batches if processed_batches > 0 else 0.0
+    epoch_recon_loss = running_recon_loss / processed_batches if processed_batches > 0 else 0.0
+    epoch_binary_loss = running_binary_loss / processed_batches if processed_batches > 0 else 0.0
+    epoch_denoise_loss = running_denoise_loss / processed_batches if processed_batches > 0 else 0.0
     
     return {
         'total': epoch_loss,
@@ -328,10 +337,10 @@ def evaluate(model, test_loader, device):
             data = data.to(device)
             
             # Forward pass
-            outputs = model(data, denoise=True)
+            outputs = model(data, denoise_noise_level=0.5) # Using 0.5 as default noise level for eval
             reconstruction = outputs['recon']
-            binary_latents = outputs['latents']
-            denoised_latents = outputs['denoised_latents']
+            binary_latents = outputs['encoded_latents']
+            denoised_latents = outputs.get('denoised_latents')
             
             # Compute loss
             loss_dict = model.compute_loss(data, reconstruction, binary_latents, denoised_latents)
@@ -399,7 +408,7 @@ def main():
     
     for epoch in range(args.epochs):
         # Train one epoch
-        train_loss_dict = train_epoch(model, train_loader, optimizer, device, epoch, args.epochs)
+        train_loss_dict = train_epoch(model, train_loader, optimizer, device, epoch, args.epochs, args)
         train_loss = train_loss_dict['total']
         train_losses.append(train_loss)
         
@@ -449,7 +458,7 @@ def main():
     
     # Generate samples
     with torch.no_grad():
-        samples = model.generate(16, temperature=1.0)
+        samples = model.generate(batch_size=16)
     
     # Save generated samples
     plt.figure(figsize=(12, 8))
