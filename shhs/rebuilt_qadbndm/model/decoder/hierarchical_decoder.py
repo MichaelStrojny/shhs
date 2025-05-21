@@ -429,16 +429,6 @@ class HierarchicalDecoder(nn.Module):
             )
         
         # Create level compatibility conversion modules for handling arbitrary level combinations
-        self.level_compatibility = nn.ModuleList([
-            nn.ModuleList([
-                nn.Sequential(
-                    nn.Conv2d(extended_latent_dims[source_idx], extended_latent_dims[target_idx], kernel_size=1),
-                    nn.ReLU()
-                ) if source_idx != target_idx else nn.Identity()
-                for source_idx in range(max_levels)
-            ])
-            for target_idx in range(max_levels)
-        ])
     
     def apply_cross_level_attention(self, outputs: List[torch.Tensor], level_indices: List[int]) -> List[torch.Tensor]:
         """

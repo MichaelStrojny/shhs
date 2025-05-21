@@ -27,8 +27,6 @@ class LatentOptimizer:
         max_anneals: int = 1000,
         min_anneal_time: float = 10.0,
         max_anneal_time: float = 100.0,
-        complexity_threshold: float = 0.5,
-        batch_factor: float = 2.0,
         device: Optional[torch.device] = None
     ):
         """
@@ -40,8 +38,6 @@ class LatentOptimizer:
             max_anneals: Maximum number of annealing runs per sample
             min_anneal_time: Minimum annealing time in microseconds
             max_anneal_time: Maximum annealing time in microseconds
-            complexity_threshold: Threshold for determining complex vs. simple regions
-            batch_factor: Factor for determining batch size based on complexity
             device: Device to use for tensor operations
         """
         self.latent_size = latent_size
@@ -49,8 +45,6 @@ class LatentOptimizer:
         self.max_anneals = max_anneals
         self.min_anneal_time = min_anneal_time
         self.max_anneal_time = max_anneal_time
-        self.complexity_threshold = complexity_threshold
-        self.batch_factor = batch_factor
         self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
         # Precompute normalized scale for different latent sizes
@@ -214,6 +208,9 @@ class LatentOptimizer:
         # Clamp to range
         optimal_time = max(self.min_anneal_time, min(self.max_anneal_time, optimal_time))
         
+        # Note: The calculated `optimal_time` is a heuristic and might not be
+        # directly used by all sampler backends (specifically,
+        # `neal.SimulatedAnnealingSampler` in `QuantumSampler` uses `num_sweeps`).
         return optimal_time
     
     def _optimal_dbns_per_run(
