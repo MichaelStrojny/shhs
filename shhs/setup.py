@@ -1,0 +1,38 @@
+from setuptools import setup, find_packages
+
+setup(
+    name="rebuilt_qadbndm",
+    version="0.2.0",
+    packages=find_packages(),
+    include_package_data=True,
+    python_requires=">=3.8",
+    install_requires=[
+        "torch>=1.9.0",
+        "torchvision>=0.10.0",
+        "numpy>=1.19.0",
+        "matplotlib>=3.3.0",
+        "dimod>=0.10.0",
+        "dwave-neal>=0.5.7",
+        "pandas>=1.1.0",
+        "tqdm>=4.50.0",
+        "scikit-learn>=0.24.0",
+        "pillow>=8.0.0",
+    ],
+    author="Your Name",
+    author_email="your.email@example.com",
+    description="Enhanced Quantum-Assisted Deep Binary Neural Diffusion Model with adaptive hierarchy and cross-level conditioning",
+    long_description=open("README.md").read(),
+    long_description_content_type="text/markdown",
+    url="https://github.com/yourusername/rebuilt_qadbndm",
+    classifiers=[
+        "Development Status :: 3 - Alpha",
+        "Intended Audience :: Science/Research",
+        "License :: OSI Approved :: MIT License",
+        "Programming Language :: Python :: 3",
+        "Programming Language :: Python :: 3.8",
+        "Programming Language :: Python :: 3.9",
+        "Programming Language :: Python :: 3.10",
+        "Topic :: Scientific/Engineering :: Artificial Intelligence",
+        "Topic :: Scientific/Engineering :: Physics",
+    ],
+) 
