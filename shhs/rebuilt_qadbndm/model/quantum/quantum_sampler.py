@@ -48,7 +48,7 @@ class QuantumSampler:
             latent_size: Maximum size of the latent space
             max_batch_size: Maximum number of DBNs to process in a single quantum annealing run
             num_anneals: Number of annealing runs per sample
-            annealing_time: Annealing time in microseconds
+            annealing_time: Annealing time in microseconds. Note: This parameter is not directly used by `neal.SimulatedAnnealingSampler` which relies on `num_sweeps` instead. It's provided for broader sampler compatibility.
             sweep_factor: Factor for determining number of sweeps in simulated annealing
             multi_anneal: Whether to use multi-anneal approach with selection of best results
             anneals_per_run: Number of anneals to perform per quantum annealing run
@@ -87,7 +87,7 @@ class QuantumSampler:
         
         Args:
             num_anneals: Number of annealing runs per sample
-            anneal_time: Annealing time in microseconds
+            anneal_time: Annealing time in microseconds. Note: This parameter is not directly used by `neal.SimulatedAnnealingSampler` which relies on `num_sweeps` instead. It's provided for broader sampler compatibility.
             level_priorities: Priority weights for each hierarchical level
         """
         if num_anneals is not None:
@@ -554,6 +554,13 @@ class QuantumSampler:
         Returns:
             List of visible sample tensors
         """
+        # Note: Current implementation processes DBNs sequentially using
+        # self.sample_dbn. For CrossLevelDBN instances, if source_latents
+        # are not provided (as is the case in the current call from DBNDenoiser's
+        # train_with_quantum or denoise_step's batching), it falls back to
+        # classical Gibbs sampling within the CrossLevelDBN's forward method.
+        # True batched quantum annealing of multiple DBNs (especially CrossLevelDBNs
+        # with their dependencies) into a single QUBO is not implemented here.
         num_dbns = len(dbns)
         
         # Ensure we don't exceed max batch size
@@ -576,9 +583,12 @@ class QuantumSampler:
         for i, (dbn, input_tensor) in enumerate(zip(dbns, inputs)):
             # Sample from this DBN
             if hasattr(dbn, 'target_visible_dim'):
-                # This is a CrossLevelDBN, we need source latents
-                # Since we don't have them here, fall back to standard sampling
-                _, samples, _ = dbn(input_tensor, k=1)
+                # This is a CrossLevelDBN.
+                # The current call path from DBNDenoiser's batching logic
+                # does not provide source_latents to this function.
+                # Thus, sample_cl_dbn cannot be used directly here.
+                # Falling back to classical Gibbs sampling within the CLDBN.
+                _, samples, _ = dbn(input_tensor, source_latents=None, k=1) # Pass k=1 for consistency
             else:
                 # Standard DBN
                 _, samples, _ = self.sample_dbn(dbn, input_tensor)
